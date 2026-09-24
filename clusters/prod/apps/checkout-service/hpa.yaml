@@ -1,0 +1,34 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: checkout-service
+  namespace: platform
+  labels:
+    app.kubernetes.io/name: checkout-service
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: platform
+    app.kubernetes.io/managed-by: flux
+    platform.io/team: platform
+    platform.io/cost-centre: CC-0001
+    platform.io/env: prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout-service
+  minReplicaCount: 2
+  maxReplicaCount: 15
+  cooldownPeriod: 60
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+        metricName: http_requests_per_second
+        query: sum(rate(http_requests_total{app="checkout-service"}[2m]))
+        threshold: "100"
+    - type: aws-sqs-queue
+      metadata:
+        queueURL: https://sqs.eu-west-1.amazonaws.com/123456789012/checkout-orders
+        queueLength: "50"
+        awsRegion: eu-west-1

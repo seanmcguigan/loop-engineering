@@ -1,0 +1,30 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+tfplan*.binary
+tfplan*.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Loop run artifacts — state/ and triage/ dirs are tracked (via .gitkeep) but contents are not
+state/*.md
+state/*.json
+triage/*.md
+triage/*.json
+
+# Policy pass sentinel (ephemeral, written by CI)
+.checkov-passed
+
+# Claude Code local overrides
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store

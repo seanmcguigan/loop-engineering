@@ -1,0 +1,20 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: checkout-service-pdb
+  namespace: platform
+  labels:
+    app.kubernetes.io/name: checkout-service
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: platform
+    app.kubernetes.io/managed-by: flux
+    platform.io/team: platform
+    platform.io/cost-centre: CC-0001
+    platform.io/env: prod
+spec:
+  minAvailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: checkout-service

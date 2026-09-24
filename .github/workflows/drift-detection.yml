@@ -1,0 +1,44 @@
+name: Nightly Drift Detection
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 02:00 UTC nightly
+  workflow_dispatch:        # allow manual trigger
+
+jobs:
+  drift-detection:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: eu-west-1
+
+      - name: Set up kubectl and flux
+        run: |
+          aws eks update-kubeconfig --name prod-cluster --region eu-west-1
+          curl -sL https://github.com/fluxcd/flux2/releases/download/v2.3.0/flux_2.3.0_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin flux
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run drift detection loop
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: bash loops/drift-detection.sh
+
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-findings-${{ github.run_id }}
+          path: state/drift-*.json
+          retention-days: 30

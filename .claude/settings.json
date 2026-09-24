@@ -1,0 +1,53 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/block-prod-without-ticket.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/require-policy-pass.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash(git commit:*)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/secret-scan-pre-commit.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(terraform *)",
+      "Bash(kubectl get *)",
+      "Bash(kubectl describe *)",
+      "Bash(kubectl logs *)",
+      "Bash(kubectl diff *)",
+      "Bash(kubectl apply *)",
+      "Bash(kubectl rollout *)",
+      "Bash(flux *)",
+      "Bash(checkov *)",
+      "Bash(opa *)",
+      "Bash(gitleaks *)",
+      "Bash(git *)",
+      "Bash(kustomize *)",
+      "Read(*)",
+      "Write(clusters/**)",
+      "Write(terraform/modules/**)",
+      "Write(clusters/base/**)"
+    ],
+    "deny": [
+      "Bash(kubectl delete namespace:*)",
+      "Bash(terraform destroy:*)"
+    ]
+  }
+}
