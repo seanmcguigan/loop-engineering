@@ -5,4 +5,4 @@ resources:
   - service.yaml
   - pdb.yaml
   - hpa.yaml
-  - peer-authentication.yaml
+  # peer-authentication.yaml requires Istio CRDs — omit on kind, include in prod overlay
