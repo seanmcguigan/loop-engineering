@@ -17,7 +17,8 @@ images:
 
 patches:
   # kind-only: prod image handles readOnlyRootFilesystem and /health; nginx-unprivileged needs
-  # to write pid/cache files, and serves / not /health, so relax both for local testing.
+  # to write pid/cache files, serves / not /health, and runs as uid 101 (not 1000).
+  # REMOVE THIS ENTIRE PATCHES BLOCK before deploying to prod — replace image with real registry image above.
   - patch: |-
       apiVersion: apps/v1
       kind: Deployment
@@ -27,6 +28,8 @@ patches:
       spec:
         template:
           spec:
+            securityContext:
+              runAsUser: 101
             containers:
               - name: checkout-service
                 securityContext:

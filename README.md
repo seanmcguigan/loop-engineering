@@ -136,7 +136,14 @@ flowchart TD
 
 ### 2.2 Hooks — governance that can't be skipped
 
-This is where "governance by default" stops being a CLAUDE.md suggestion and becomes enforcement. A **PreToolUse hook** runs your check as a script and blocks a tool from executing unless the check passes. Examples worth building early:
+This is where "governance by default" stops being a CLAUDE.md suggestion and becomes enforcement. Claude Code has two hook event types — they fire at different points:
+
+- **PreToolUse hook** — fires before Claude executes a specific tool call. Blocks that one tool call. Use for "don't run this command without X" (e.g. block `kubectl apply` without a ticket).
+- **Stop hook** — fires when Claude tries to end its turn entirely. Blocks the session from closing. Use for "don't finish until this condition holds" (e.g. `terraform validate` must pass before the session can close). Claude Code overrides after 8 consecutive blocks so it can't hang forever.
+
+Both use `exit 2` to hard-block. `exit 1` is non-blocking in both cases — the error logs, execution continues.
+
+Examples worth building early:
 
 - Block `terraform apply` if the command targets `env=prod` without a ticket reference in the commit message or `TICKET` env var.
 - Block `kubectl apply` to `clusters/prod/` unless a `checkov`/OPA policy pass has run in the current session.
@@ -219,9 +226,13 @@ The model forgets between sessions; the repo doesn't. For anything that runs mor
 A concrete pattern: after every automation run, write a findings file to `state/triage-<date>.md`. The next run reads the previous file before generating new findings. The triage inbox (`triage/`) surfaces unresolved items for human review. This is what Osmani calls "the spine of the whole thing."
 
 > [!NOTE]
-> **Observed in practice:** Running `morning-triage.sh` produced no findings file — the `claude -p` call ran silently and the script reported "findings file was not produced." Root cause: `gh run list` and `flux get kustomizations` require external connections (GitHub CLI auth, live cluster kubeconfig) that weren't available. The script handled it gracefully without crashing, but the triage inbox was not updated. In a real CI environment with OIDC auth and a cluster kubeconfig wired in, all four checks populate automatically. The state pattern itself is sound; the tools it depends on need to be connected first.
+> **Observed in practice:** Running `morning-triage.sh` produced no findings file — the `claude -p` call ran silently and the script reported "findings file was not produced." Root cause: `gh run list` and `flux get kustomizations` require external connections (GitHub CLI auth, live cluster kubeconfig) that weren't available. The script handled it gracefully without crashing, but the triage inbox was not updated. In a real CI environment with OIDC auth and a cluster kubeconfig wired in, all four checks populate automatically.
 >
-> A second finding emerged in 3.4: an actionable item in the triage file read "Labels updated to app.kubernetes.io/* schema" — omitting the `platform.io/*` half of the required label set. The adversarial reviewer flagged this as a k8s-governance violation. The code was correct; the wording was ambiguous enough that an engineer actioning it might implement only half. Triage output that reaches humans needs to be as precise as code — underspecified instructions are a gap in the handoff.
+> A second gap was found on review: the original `--allowedTools` list had no `ls` or `cat`, so Claude could not read the previous triage file — meaning the state spine did not actually work. The fix was adding `Bash(ls state/*)` and `Bash(cat state/*)` to the allowedTools list and an explicit step 0 to the prompt. The lesson: any claim that a loop reads previous state must be verified against the allowedTools list, not just the prompt.
+>
+> A third gap: `Write(state/*)` in `--allowedTools` does not work in headless mode — Claude Code resolves the file path to absolute form before matching, so relative patterns never match. The loop silently produced no output. The initial fix was `Write` unrestricted, but that is also wrong: it would let Claude overwrite Terraform modules or hook scripts even when Bash is fully locked down. The correct fix is to remove `Write` from `--allowedTools` entirely — Claude outputs findings as its text response, and the bash script extracts `.result` from the JSON envelope and writes the file. Claude reads, bash writes. Once fixed, the loop ran successfully: it read the previous triage file from two weeks earlier, pulled 6 consecutive CI failures from the drift detection workflow via `gh run list`, carried forward unresolved actionable items, and wrote a fresh triage file. The state spine worked end to end.
+>
+> A third finding emerged in 3.4: an actionable item in the triage file read "Labels updated to app.kubernetes.io/* schema" — omitting the `platform.io/*` half of the required label set. The adversarial reviewer flagged this as a k8s-governance violation. The code was correct; the wording was ambiguous enough that an engineer actioning it might implement only half. Triage output that reaches humans needs to be as precise as code — underspecified instructions are a gap in the handoff.
 
 ---
 
@@ -242,6 +253,21 @@ and post the summary as a PR comment via gh." \
 ```
 
 Scope `--allowedTools` tightly for anything running unattended against real infrastructure — this is your single most important safety control at this stage. Expanding the allowlist should require the same review as expanding IAM permissions.
+
+**Write tool in headless loops — leave it out entirely.** The correct architecture for a headless loop is: Claude reads data via scoped Bash tools and outputs findings as its text response; the bash orchestrator extracts `.result` from the JSON envelope and writes the file. This removes `Write` from `--allowedTools` completely. The alternative — `Write` unrestricted — is dangerous because it lets Claude overwrite anything in the project directory, including Terraform modules, hooks, and OPA policies, even when Bash is fully locked down. Unrestricted `Write` with scoped Bash is not a safe trade-off; it just shifts the blast radius from execution to file corruption.
+
+```bash
+# Claude outputs findings as text — bash writes the file
+if ! API_JSON=$(claude -p "...output findings as your final response, do not use Write..." \
+  --allowedTools "Bash(gh run list *),Bash(git log *)" \
+  --output-format json 2>&1); then
+  echo "WARNING: claude -p failed" >&2
+fi
+RESULT=$(echo "${API_JSON}" | jq -r '.result // empty')
+[[ -n "${RESULT}" ]] && echo "${RESULT}" > "${FINDINGS_FILE}"
+```
+
+Note: `Write(state/*)` path-scoped patterns also do not work in `--allowedTools` — Claude Code resolves the file path to absolute form before checking, so relative patterns never match. The stdout-capture approach sidesteps this entirely.
 
 Write loop output to `state/` before the session ends. Terminal scrollback that disappears when the session closes is not an audit trail.
 
@@ -343,7 +369,7 @@ Even in a fully scheduled or CI-triggered loop, keep an explicit approval gate b
 
 Osmani's post is direct on three failure modes that appear only once loops run well:
 
-**Verification debt.** A loop running unattended is also making mistakes unattended. The sub-agent verifier and Stop hooks address this mechanically, but "done" in a loop output is still a claim, not a proof. The weekly loop review (reading `state/` output) is the non-mechanical layer.
+**Verification debt.** A loop running unattended is also making mistakes unattended. The sub-agent verifier and hooks address this mechanically — PreToolUse hooks block bad actions mid-session; Stop hooks enforce a clean state before the session closes (e.g. `terraform validate` must pass before the session ends). But "done" in a loop output is still a claim, not a proof. The weekly loop review (reading `state/` output) is the non-mechanical layer.
 
 **Comprehension debt.** The faster a loop ships code you didn't write, the wider the gap between what exists and what you understand. Smooth loops accelerate this gap unless you actively read the output. Treat `state/` as required reading, not an archive. Schedule time to review what the loop produced — not to approve it retroactively, but to keep your mental model current.
 
@@ -389,9 +415,10 @@ platform-loops/
 │   │   ├── cost-reviewer.md          # sub-agent: instance types, over-provisioning
 │   │   └── sre-verifier.md           # sub-agent: SLO/alerting coverage check
 │   └── hooks/
-│       ├── block-prod-without-ticket.sh
-│       ├── secret-scan-pre-commit.sh
-│       └── require-policy-pass.sh
+│       ├── block-prod-without-ticket.sh   # PreToolUse: blocks prod writes without ticket
+│       ├── require-policy-pass.sh          # PreToolUse: blocks prod writes without policy pass
+│       ├── secret-scan-pre-commit.sh       # PreToolUse: gitleaks scan before git commit
+│       └── stop-require-terraform-valid.sh # Stop: session cannot close with failing .tf files
 ├── terraform/                      # all Terraform code
 │   ├── modules/                     # reusable modules — never call directly, use environments/
 │   │   ├── vpc/                     # VPC, subnets, IGW, NAT GW, route tables
@@ -483,39 +510,509 @@ For anything without a mature MCP server yet, the CLI-tool pattern (`gh`, `aws`,
 
 ---
 
-## Open gaps — require external wiring before they close
+## Part 8 — Commissioning: making the loops live
 
-These items were identified during a full review of `platform-loops/` against the practices in this document. They were not auto-fixed because each depends on credentials or live infrastructure that must be connected first.
+The loops in `loops/` run `claude -p` with real intent behind them, but hit external systems — GitHub, a Kubernetes cluster, AWS, Cloudflare, New Relic. Until those are wired, the loops run partially or silently. This section is split into two clear zones:
 
-### WAF drift check uses the wrong Wrangler command
+- **Local** — everything you can validate on your laptop with no external accounts
+- **Production** — the real wiring steps, in dependency order
 
-`loops/drift-detection.sh` checks for Cloudflare WAF drift using `wrangler pages deployment list`, which lists Cloudflare Pages deployments — not WAF rulesets. Actual WAF rule drift requires the Cloudflare API (`GET /zones/:zone_id/firewall/rules` or the equivalent `wrangler waf-rules list` command) and a zone ID.
+Start local. Confirm the loop logic works. Then wire prod one step at a time.
 
-**To close:** Wire Cloudflare credentials (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE_ID`) into the `drift-detection.yml` workflow as repository secrets. Replace the `wrangler pages deployment list` check in `drift-detection.sh` with a Cloudflare API call that reads the current WAF ruleset and diffs it against `state/waf-baseline.json`.
+---
 
-### Loop health observability (Part 4.6) has no implementation
+## Local environment — no accounts required
 
-Part 4.6 defines the signals that tell you whether your governance rules are well-calibrated or generating noise: drift detection exit codes, morning triage actionable item count, PR policy check FAIL rate, Stop hook block count, and `sre-verifier` BLOCKED ratio. None of these are currently emitted, stored, or alerted on.
+### What works right now, without any credentials
 
-**To close:** Wire a New Relic account and emit a custom event from each loop script after it runs:
+Before touching any credentials, these all run today:
+
+- All four hooks fire correctly — PreToolUse gates on `kubectl apply` and `terraform apply`; Stop hook fires when `.tf` files are modified and exits 2 until `terraform validate` passes.
+- `terraform validate`, `checkov`, and OPA policy evaluation against plan JSON.
+- `/goal` with its separate evaluator model, sub-agents, skills, and the writer/reviewer pattern.
+- `morning-triage.sh` writes a triage file and reads the previous one. It handles missing external connections gracefully — each section says "None — connect X to enable this check" rather than crashing.
 
 ```bash
-curl -s -X POST "https://insights-collector.newrelic.com/v1/accounts/${NR_ACCOUNT_ID}/events" \
-  -H "X-Insert-Key: ${NR_INSERT_KEY}" \
-  -H "Content-Type: application/json" \
-  -d "[{\"eventType\":\"LoopRun\",\"loop\":\"drift-detection\",\"verdict\":\"${VERDICT}\",\"timestamp\":$(date +%s)}]"
+cd platform-loops
+bash loops/morning-triage.sh
+# → should write state/triage-<date>.md and triage/latest.md
+# → CI Failures and Flux sections will say "not connected" — that is correct
+
+terraform -chdir=terraform/modules/rds validate
+checkov -d terraform/modules/rds --compact --quiet
+opa eval -d policies/ -i plan.json "data.platform.deny"
 ```
 
-Then build a New Relic dashboard querying `FROM LoopRun` with the alert thresholds from the table in Part 4.6. Add `NR_ACCOUNT_ID` and `NR_INSERT_KEY` as repository secrets and pass them to each workflow that invokes a loop script.
+### Mock AWS with moto (validates RDS drift detection)
 
-### `clusters/` missing `infra/` layer
+**moto** is an open-source Python library that mocks AWS APIs including Aurora RDS — free, no account required. It runs as a standalone HTTP server that the AWS CLI talks to identically to the real API.
 
-`flux-conventions` defines a `clusters/<env>/infra/` path alongside `apps/` for infrastructure components — Karpenter controllers, cert-manager, external-secrets-operator, KEDA, etc. Only `apps/` and `flux-system/` exist per cluster. Without the `infra/` layer, these components are either installed out-of-band (no GitOps, no drift detection) or not installed at all.
+```bash
+pip install 'moto[rds,server]'
 
-**To close:** Create `clusters/prod/infra/`, `clusters/staging/infra/`, and `clusters/dev/infra/` directories. Add a Flux `Kustomization` CR pointing at each in the relevant `gotk-sync.yaml`. Populate with `HelmRelease` manifests for each infrastructure component, pinned to specific chart versions. Add those Deployments to the prod `healthChecks` list in `gotk-sync.yaml`.
+# Start the moto server on port 4566 in the background
+moto_server -p 4566 &
 
-### `monitoring/checkout-service/dashboard.json` does not exist
+# Point the AWS CLI at moto
+export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_DEFAULT_REGION=eu-west-1
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
 
-`observability-standards` requires a New Relic dashboard JSON committed to `monitoring/<service>/dashboard.json` and applied via Terraform. The `slo.tf` and `alerts.tf` stubs exist; the dashboard file does not, because it requires a real New Relic account to export a populated dashboard from.
+# Create a fake Aurora cluster
+aws rds create-db-cluster \
+  --db-cluster-identifier prod-checkout \
+  --engine aurora-postgresql \
+  --engine-version 15.4 \
+  --master-username postgres \
+  --master-user-password changeme \
+  --no-cli-pager
 
-**To close:** Build the dashboard in New Relic with panels for SLO burn rate (1h/6h/24h), golden signals (request rate, error rate, latency p50/p95/p99), pod count, CPU, and memory. Export the JSON via the New Relic API (`GET /v2/dashboards/:id`) or Terraform import. Commit to `monitoring/checkout-service/dashboard.json` and add a `newrelic_one_dashboard` resource to a `dashboard.tf` file in the same directory.
+# Verify it appears
+aws rds describe-db-clusters \
+  --query 'DBClusters[*].{ID:DBClusterIdentifier,Status:Status,Engine:Engine}'
+
+# Run the drift detection loop against it
+bash loops/drift-detection.sh
+```
+
+The drift script will call `describe-db-clusters`, see the fake cluster as `available`, and write a `CLEAN` verdict to `state/`. No AWS account required.
+
+> **Note:** moto runs in-process with no Docker dependency. If you have a LocalStack Pro license (which includes RDS/Aurora), you can substitute `moto_server -p 4566 &` with `docker run --rm -d -p 4566:4566 -e LOCALSTACK_AUTH_TOKEN=<token> localstack/localstack` — the AWS CLI commands are identical. The free LocalStack Community tier does not cover RDS.
+
+**What moto validates:** RDS describe calls, drift detection logic, findings JSON output.  
+**What moto cannot validate:** Real Aurora connectivity, IAM auth, cross-account access.
+
+### Mock Kubernetes with kind (validates Flux and kubectl checks)
+
+**kind** (Kubernetes in Docker) gives you a local cluster for testing the kubectl and Flux reconciliation checks.
+
+```bash
+# Install kind
+brew install kind   # or: curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64 && chmod +x kind
+
+# Create a local cluster
+kind create cluster --name platform-loops
+
+# Verify kubectl works
+kubectl get nodes
+
+# Install Flux on the kind cluster
+flux bootstrap github \
+  --owner=<your-org> \
+  --repository=platform-loops \
+  --branch=main \
+  --path=./clusters/prod \
+  --personal
+
+# Install KEDA imperatively — local shortcut because the infra/ HelmRelease layer (Step 4)
+# does not exist on kind yet. In prod, KEDA is managed by a HelmRelease in clusters/prod/infra/.
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo update
+helm install keda kedacore/keda --namespace keda --create-namespace --wait
+
+# kind single-node clusters have no zone label; the checkout-service deployment has a
+# hard topology spread constraint on topology.kubernetes.io/zone — add it manually
+kubectl label node platform-loops-control-plane topology.kubernetes.io/zone=eu-west-1a
+
+# Create a placeholder New Relic secret — the deployment mounts it with Optional: false
+# so the pod will never start without it (swap for a real key when connecting New Relic)
+kubectl create secret generic newrelic-license \
+  --from-literal=licenseKey=placeholder \
+  -n platform
+
+# Morning triage will now show Flux reconciliation status
+bash loops/morning-triage.sh
+```
+
+**What kind validates:** Flux reconciliation, kustomization structure, ScaledObject CRD, pod scheduling, morning triage Flux section.  
+**What kind cannot validate:** Multi-zone topology (single node), Istio mTLS/PeerAuthentication (not installed), real image pull from a private registry, New Relic APM, EKS-specific node groups or Karpenter.
+
+> **Kind workarounds in the current overlay:** `clusters/prod/apps/checkout-service/kustomization.yaml` contains kind-specific patches — a placeholder image (`nginxinc/nginx-unprivileged:alpine`), relaxed security context, and adjusted health probe paths. These must be replaced before the overlay is used against a real cluster. See [Before deploying to prod](#before-deploying-to-prod--resolve-kind-workarounds) below.
+
+**Tearing down:**
+```bash
+kill %1   # stop moto_server background process
+kind delete cluster --name platform-loops
+unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+```
+
+### Local environment summary
+
+| Tool | Validates | Does not validate |
+|------|-----------|-------------------|
+| No deps | Hooks, terraform validate, checkov, OPA, triage file | Anything requiring external connections |
+| moto | RDS describe calls, drift detection logic, findings JSON | Real Aurora, IAM auth, cross-account |
+| kind | Flux reconciliation, kustomizations, ScaledObject, pod scheduling | Multi-zone, Istio mTLS, private registry, EKS, Karpenter |
+
+---
+
+## Before deploying to prod — resolve kind workarounds
+
+The kind setup introduced local-only workarounds that are committed to `clusters/prod/`. Resolve these before pointing Flux at a real cluster:
+
+1. **Replace the placeholder image** — `clusters/prod/apps/checkout-service/kustomization.yaml` overrides the image to `nginxinc/nginx-unprivileged:alpine`. Replace with your real registry image (semver-pinned, not a mutable tag) and remove the `images:` and `patches:` blocks entirely.
+
+2. **Restore PeerAuthentication** — `peer-authentication.yaml` is commented out (Istio not present on kind). Uncomment it once Istio is installed on the target cluster. Without it, the `platform` namespace has no mTLS STRICT enforcement.
+
+3. **Remove the security context patch** — The `patches:` block disables `readOnlyRootFilesystem` and changes health probe paths from `/health` to `/`. The prod image must handle both correctly so the patch is not needed.
+
+4. **Create the overlay structure** — The right long-term fix is `clusters/base/` + `clusters/kind/` + `clusters/prod/` so kind-specific changes never exist in the prod overlay. Until then, review `clusters/prod/apps/checkout-service/kustomization.yaml` carefully before each prod deployment.
+
+5. **Ticket references** — CLAUDE.md requires `[PLAT-XXXX]` in every commit that touches `clusters/prod/`. Apply this to all future prod commits.
+
+---
+
+## Production commissioning — wiring real services
+
+Each step below is independently deployable. Partial commissioning is still useful. Steps 1 and 3 deliver the most immediate value.
+
+### Before any step — if you use Azure AI Foundry for Claude
+
+Claude Code supports a custom API endpoint via `ANTHROPIC_BASE_URL`. If your organisation routes Claude through Azure AI Foundry rather than the Anthropic API directly, set two environment variables instead of a raw Anthropic key:
+
+```bash
+export ANTHROPIC_BASE_URL="https://<your-resource>.services.ai.azure.com/models"
+export ANTHROPIC_API_KEY="<your-azure-subscription-key>"
+```
+
+Your local Claude Code session is already working this way — the shell picked these up from your environment. For GitHub Actions workflows, add both as repository secrets (`ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`) and the workflows will use them automatically. The `claude -p` calls in the loop scripts are identical either way.
+
+---
+
+### Step 1 — Wire GitHub CLI
+
+**Unlocks:** CI failure detection in morning triage, open issue scanning, automated PR policy comment posting.
+
+```bash
+gh auth login          # browser OAuth: select GitHub.com, HTTPS
+gh auth status         # verify token is active
+```
+
+**Verify:**
+```bash
+gh run list --limit 5
+bash loops/morning-triage.sh
+# → "CI Failures" and "Open Platform Issues" sections now populate
+```
+
+Once authenticated, `pr-policy-check.sh` can post comments via `gh pr comment`. `morning-triage.sh` reads CI failures via `gh run list`. Both were silently skipping before.
+
+---
+
+### Step 2 — Wire OIDC for CI
+
+**Unlocks:** `pr-policy-check.yml` and `drift-detection.yml` run in GitHub Actions with short-lived AWS credentials — no long-lived keys stored as secrets.
+
+**Prerequisites:** AWS account, IAM permissions to create a role and OIDC provider.
+
+**1. Create the GitHub Actions OIDC provider in IAM:**
+```bash
+# Get the thumbprint
+THUMBPRINT=$(openssl s_client -connect token.actions.githubusercontent.com:443 \
+  -servername token.actions.githubusercontent.com < /dev/null 2>/dev/null \
+  | openssl x509 -fingerprint -noout \
+  | sed 's/://g' | cut -d= -f2 | tr '[:upper:]' '[:lower:]')
+
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list "${THUMBPRINT}"
+```
+
+**2. Create an IAM role with a trust policy scoped to your repo:**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:<your-org>/platform-loops:*"
+      }
+    }
+  }]
+}
+```
+
+Attach least-privilege policies: `terraform plan` needs `ReadOnlyAccess` + `AmazonRDSReadOnlyAccess`; drift detection needs `AmazonEKSClusterPolicy` (read) and `AmazonRDSReadOnlyAccess`.
+
+**3. Add the role ARN as a repository secret:** `AWS_CI_ROLE_ARN`
+
+The `drift-detection.yml` and `pr-policy-check.yml` workflows use `aws-actions/configure-aws-credentials@v4` with `role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}`. Until this secret is set, the credentials step is skipped and both workflows degrade gracefully — checkov and OPA still run, terraform plan and kubectl steps are skipped.
+
+**Verify:** Open a test PR that touches a `.tf` file — `pr-policy-check.yml` should trigger and post a comment within a few minutes.
+
+---
+
+### Step 3 — Connect a Kubernetes cluster
+
+**Unlocks:** `kubectl get nodes`, `flux get kustomizations`, deprecated API scanning in `drift-detection.sh`. The Flux Reconciliation Issues section in morning triage populates.
+
+```bash
+# Update kubeconfig for your EKS cluster
+aws eks update-kubeconfig --region eu-west-1 --name <cluster-name>
+
+# Verify connectivity
+kubectl get nodes
+kubectl get namespaces
+```
+
+**Bootstrap Flux** (if not already running on the cluster):
+```bash
+flux bootstrap github \
+  --owner=<your-org> \
+  --repository=platform-loops \
+  --branch=main \
+  --path=./clusters/prod \
+  --personal
+```
+
+Flux reads `clusters/prod/flux-system/gotk-sync.yaml` — this file is already committed. On first reconcile the `flux-system` Kustomization begins syncing `clusters/prod/`. The `healthChecks` in `gotk-sync.yaml` will report the checkout-service Deployment and ScaledObject as healthy once they exist on the cluster.
+
+**How Flux applies manifests — the reconciliation chain**
+
+`gotk-sync.yaml` tells Flux to watch `./clusters/prod`. Flux doesn't glob that directory for every YAML file — it looks specifically for objects of `kind: Kustomization` (the Flux CRD). Those Kustomization objects each point at a path, and Flux runs `kustomize build` on that path using the `kustomization.yaml` found there.
+
+The chain for this repo:
+
+```
+gotk-sync.yaml  →  path: ./clusters/prod
+                       └── flux-system/kustomization.yaml   (bootstrap-managed, owns flux-system itself)
+                       └── apps/kustomization.yaml          (your file — the manifest of record)
+                             └── ../../base/namespaces.yaml
+                             └── checkout-service/kustomization.yaml
+                                   └── deployment.yaml, service.yaml, pdb.yaml, hpa.yaml
+```
+
+`kustomization.yaml` is the contract for its directory:
+
+- **Listed under `resources:`** → Flux applies the resource and owns it. If you later remove it from the list, Flux deletes the object from the cluster on the next reconcile (because `prune: true` is set in `gotk-sync.yaml`).
+- **Not listed** → Flux ignores the file entirely, even if it sits in the same directory.
+- **Commented out** → identical to not listed; the file exists on disk but Flux never reads it.
+
+This is why `peer-authentication.yaml` is commented out rather than deleted — the file is kept for reference and will be included when Istio is present, but Flux does not apply it and will not prune it.
+
+**Verify:**
+```bash
+flux get kustomizations --all-namespaces
+# → flux-system should show Ready=True
+
+bash loops/morning-triage.sh
+# → Flux Reconciliation Issues section now populates
+```
+
+---
+
+### Step 4 — Add the `infra/` layer to clusters
+
+**Unlocks:** GitOps management for infrastructure components — Karpenter, cert-manager, KEDA, external-secrets-operator. Without this, these components are either installed manually (no drift detection) or not present.
+
+**Prereq:** Step 3 complete — Flux is bootstrapped.
+
+```bash
+mkdir -p clusters/prod/infra clusters/staging/infra clusters/dev/infra
+```
+
+Do **not** edit `gotk-sync.yaml` — it is marked `DO NOT EDIT` and is overwritten on every `flux bootstrap` run. Instead, create a new file `clusters/prod/flux-system/infra-kustomization.yaml` and add it to `clusters/prod/flux-system/kustomization.yaml` under `resources:`.
+
+Create `clusters/prod/flux-system/infra-kustomization.yaml`:
+```yaml
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infra-prod-components
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: flux-system          # waits for the base flux-system reconcile
+  interval: 10m
+  path: ./clusters/prod/infra
+  prune: true
+  wait: true
+  timeout: 10m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system            # the GitRepository created by bootstrap
+```
+
+Then add it to `clusters/prod/flux-system/kustomization.yaml`:
+```yaml
+resources:
+  - gotk-components.yaml
+  - gotk-sync.yaml
+  - infra-kustomization.yaml    # add this line
+```
+
+Add a `HelmRepository` source and a `HelmRelease` for each infrastructure component. KEDA is the first and most critical — it provides the `ScaledObject` CRD that checkout-service depends on.
+
+Create `clusters/prod/infra/keda-source.yaml`:
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: HelmRepository
+metadata:
+  name: kedacore
+  namespace: flux-system
+spec:
+  interval: 24h
+  url: https://kedacore.github.io/charts
+```
+
+Create `clusters/prod/infra/keda-helmrelease.yaml`:
+```yaml
+apiVersion: helm.toolkit.fluxcd.io/v2beta2
+kind: HelmRelease
+metadata:
+  name: keda
+  namespace: keda
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: keda
+      version: "2.x"          # pin to a minor version range — no floating latest
+      sourceRef:
+        kind: HelmRepository
+        name: kedacore
+        namespace: flux-system
+      interval: 12h
+  install:
+    createNamespace: true
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+```
+
+Create `clusters/prod/infra/kustomization.yaml` to wire both into Flux:
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - keda-source.yaml
+  - keda-helmrelease.yaml
+```
+
+Add cert-manager and Karpenter following the same pattern — one `HelmRepository` source per chart registry, one `HelmRelease` per component, each version-pinned.
+
+**Verify:**
+```bash
+flux get helmreleases --all-namespaces
+# → keda in namespace keda should show Ready=True
+
+flux get kustomizations --all-namespaces
+# → infra-prod-components should show Ready=True after manifests are committed
+```
+
+---
+
+### Step 5 — Wire Cloudflare credentials
+
+**Unlocks:** Real WAF ruleset drift detection. Currently `loops/drift-detection.sh` runs `wrangler pages deployment list` — this lists Cloudflare Pages deployments, not WAF rules. It needs replacing with an API call that reads actual firewall rules.
+
+**1. Add repository secrets:**
+- `CLOUDFLARE_API_TOKEN` — scoped to `Zone:Read` and `Firewall Services:Read` for your zone only
+- `CLOUDFLARE_ZONE_ID` — from the Cloudflare dashboard, Overview tab for your domain
+
+**2. Replace the WAF check in `loops/drift-detection.sh`:**
+```bash
+# Replace the wrangler pages deployment list block with:
+WAF_RULES=$(curl -s \
+  "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/firewall/rules" \
+  -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+  -H "Content-Type: application/json")
+```
+Diff the returned rule IDs against `state/waf-baseline.json` and set `waf.drifted=true` in the findings JSON if any rules have been added or removed.
+
+**3. Capture the initial baseline:**
+```bash
+curl -s \
+  "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/firewall/rules" \
+  -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+  | jq "{captured_at: now | todate, zone_id: \"${CLOUDFLARE_ZONE_ID}\", rulesets: .result}" \
+  > state/waf-baseline.json
+
+git add state/waf-baseline.json
+git commit -m "chore: capture initial WAF baseline [PLAT-xxxx]"
+```
+
+**Verify:** `bash loops/drift-detection.sh` — the WAF section in the findings JSON should show a rule count and `drifted: false` against the baseline.
+
+---
+
+### Step 6 — Wire New Relic
+
+**Unlocks:** Loop health observability (Part 4.6), New Relic APM for checkout-service, `slo.tf` and `alerts.tf` apply, and the missing `monitoring/checkout-service/dashboard.json`.
+
+**Add repository secrets:**
+- `NR_ACCOUNT_ID` — from New Relic → Account settings
+- `NR_INSERT_KEY` — from New Relic → API keys → Ingest - License key
+- `NR_API_KEY` — from New Relic → API keys → User key (for Terraform and dashboard export)
+
+**Emit loop health events from each loop script.** Add after the verdict is determined in `drift-detection.sh`, `morning-triage.sh`, and `pr-policy-check.sh`:
+```bash
+curl -s -X POST \
+  "https://insights-collector.newrelic.com/v1/accounts/${NR_ACCOUNT_ID}/events" \
+  -H "X-Insert-Key: ${NR_INSERT_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "[{
+    \"eventType\": \"LoopRun\",
+    \"loop\": \"drift-detection\",
+    \"verdict\": \"${VERDICT}\",
+    \"actionable_count\": ${ACTIONABLE_COUNT:-0},
+    \"timestamp\": $(date +%s)
+  }]"
+```
+
+**Apply SLO and alert Terraform** (stubs already exist in `terraform/environments/prod/monitoring/`):
+```bash
+export TF_VAR_new_relic_account_id="${NR_ACCOUNT_ID}"
+export TF_VAR_new_relic_api_key="${NR_API_KEY}"
+terraform -chdir=terraform/environments/prod plan
+terraform -chdir=terraform/environments/prod apply
+```
+
+**Build and export the checkout-service dashboard:**
+1. In New Relic, build a dashboard with panels for: SLO burn rate (1h/6h/24h window), golden signals (request rate, error rate, latency p50/p95/p99), pod count, CPU, and memory.
+2. Export: `curl -s "https://api.newrelic.com/v2/dashboards/<id>" -H "X-Api-Key: ${NR_API_KEY}" > monitoring/checkout-service/dashboard.json`
+3. Add a `newrelic_one_dashboard` resource to a `monitoring/checkout-service/dashboard.tf` and apply.
+
+**Verify:** In New Relic Query Builder:
+```sql
+FROM LoopRun SELECT count(*) SINCE 7 days ago FACET loop
+```
+Should return rows for each loop that has run since Step 6 was wired.
+
+Build the alert thresholds from the Part 4.6 table as New Relic alert conditions against this `LoopRun` event type.
+
+---
+
+### Production commissioning sequence at a glance
+
+**Local first — no accounts needed:**
+
+| | What it validates | Limitation |
+|---|---|---|
+| No deps | Hooks, validate, checkov, OPA, triage file | No external connections |
+| moto | RDS drift detection logic, findings JSON | Not real Aurora or IAM |
+| kind | Flux reconciliation, pod scheduling, triage Flux section | No Istio, no multi-zone, no private registry |
+
+**Then wire prod, in order:**
+
+| Step | What it unlocks | Hard prereqs |
+|------|-----------------|--------------|
+| Azure AI Foundry (optional) | `claude -p` in CI via Azure endpoint | Azure AI Foundry deployment |
+| 1 — `gh auth login` | CI failures + issues in triage, PR comments | GitHub account |
+| 2 — OIDC IAM role | `pr-policy-check.yml` + `drift-detection.yml` in CI with AWS creds | AWS account, IAM write |
+| 3 — kubeconfig + Flux bootstrap | Real kubectl/Flux in triage and drift detection | EKS cluster running |
+| 4 — `infra/` layer | GitOps for Karpenter, KEDA, cert-manager | Step 3 complete |
+| 5 — Cloudflare creds | Real WAF drift detection against baseline | Cloudflare zone |
+| 6 — New Relic | Loop health signals, APM, SLO/alerts, dashboard | New Relic account |
+
+Resolve the kind workarounds in `clusters/prod/apps/checkout-service/kustomization.yaml` before Step 3 — they will be applied to the real cluster otherwise.
