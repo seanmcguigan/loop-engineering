@@ -5,7 +5,7 @@ metadata:
   namespace: flux-system
 spec:
   interval: 1m
-  url: ssh://git@github.com/your-org/platform-loops
+  url: ssh://git@github.com/seanmcguigan/loop-engineering
   ref:
     branch: main
   secretRef:
