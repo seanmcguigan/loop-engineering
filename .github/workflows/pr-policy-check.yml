@@ -62,4 +62,6 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: set if routing Claude through Azure AI Foundry instead of Anthropic API directly.
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         run: bash loops/pr-policy-check.sh

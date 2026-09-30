@@ -40,6 +40,9 @@ jobs:
       - name: Run drift detection loop
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Optional: set if routing Claude through Azure AI Foundry instead of Anthropic API directly.
+          # Add ANTHROPIC_BASE_URL as a repository secret with your Azure AI Foundry endpoint.
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         run: bash loops/drift-detection.sh
 
       # Always runs — uploads whatever findings were produced, even on partial runs.
