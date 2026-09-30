@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# CI-triggered loop: runs terraform plan + checkov + cost estimate + posts PR comment.
+# CI-triggered loop: runs terraform plan + checkov + OPA + posts PR comment.
 # Usage: PR_NUMBER=<n> bash loops/pr-policy-check.sh
 # Expected env: PR_NUMBER, AWS_PROFILE (or ROLE_ARN for CI)
+#
+# Architecture: Claude runs checks via Bash tools and outputs results as text.
+# This script extracts .result from the JSON envelope and writes the log file.
+# Write is intentionally absent from --allowedTools — Claude has no write access to the repo.
+# Note: Bash(terraform *) allows shell redirects (e.g. terraform show -json > state/tfplan.json)
+# which are needed to produce plan JSON for checkov/OPA. This is intentional.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="${REPO_ROOT}/state"
@@ -13,13 +19,9 @@ PR_NUMBER="${PR_NUMBER:?PR_NUMBER must be set}"
 
 mkdir -p "${STATE_DIR}"
 
-LOG_FILE="${STATE_DIR}/pr-${PR_NUMBER}-policy-${DATE}.json"
+LOG_FILE="${STATE_DIR}/pr-${PR_NUMBER}-policy-${DATE}.md"
 
-# Claude writes the structured LOG_FILE directly via its Write tool.
-# The raw API response envelope is captured separately to avoid overwriting it.
-API_RESPONSE_FILE="${STATE_DIR}/pr-${PR_NUMBER}-api-${DATE}.json"
-
-claude -p "
+if ! API_JSON=$(claude -p "
 You are a policy-check automation for PR #${PR_NUMBER}.
 
 Steps (run in order, stop and report on any failure):
@@ -42,12 +44,21 @@ Steps (run in order, stop and report on any failure):
    Summary | Per-Module Terraform Plan | Checkov Results | OPA Results | Tag Compliance | Verdict (PASS / FAIL)
    Post the comment: \`gh pr comment ${PR_NUMBER} --body '<comment>'\`
 
-5. Write the full aggregated structured output to ${LOG_FILE}.
+5. Output the full aggregated results as your final response. Do not use the Write tool.
 
 Do not run terraform apply.
 " \
   --allowedTools \
-    "Bash(git diff *),Bash(git log *),Bash(terraform *),Bash(checkov *),Bash(opa eval *),Bash(gh pr comment *),Write(${STATE_DIR}/*)" \
-  --output-format json > "${API_RESPONSE_FILE}"
+    "Bash(git diff *),Bash(git log *),Bash(terraform *),Bash(checkov *),Bash(opa eval *),Bash(gh pr comment *)" \
+  --output-format json 2>&1); then
+  echo "WARNING: policy check claude -p failed." >&2
+fi
 
-echo "Policy check complete. Log: ${LOG_FILE}"
+# Extract Claude's response and write the log file
+RESULT=$(echo "${API_JSON}" | jq -r '.result // empty' 2>/dev/null || true)
+if [[ -n "${RESULT}" ]]; then
+  echo "${RESULT}" > "${LOG_FILE}"
+  echo "Policy check complete. Log: ${LOG_FILE}"
+else
+  echo "WARNING: no output produced — log file not written." >&2
+fi

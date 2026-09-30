@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Scheduled loop: nightly drift detection across EKS, Aurora, and API Gateway.
-# Posts findings as New Relic custom events and writes to state/.
+# Scheduled loop: nightly drift detection across EKS, Aurora, and Cloudflare WAF.
 # Designed for cron or GitHub Actions schedule; fresh context per run (Ralph-style).
+#
+# Architecture: Claude reads cluster/cloud state and outputs findings as JSON text.
+# This script extracts .result from the JSON envelope and writes to disk.
+# Write is intentionally absent from --allowedTools — Claude has no write access to the repo.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="${REPO_ROOT}/state"
@@ -15,11 +18,7 @@ FINDINGS_FILE="${STATE_DIR}/drift-${DATE}.json"
 
 mkdir -p "${STATE_DIR}"
 
-# Claude writes the structured FINDINGS_FILE directly via its Write tool.
-# The raw API response envelope is captured separately to avoid overwriting it.
-API_RESPONSE_FILE="${STATE_DIR}/drift-api-${DATE}.json"
-
-claude -p "
+if ! API_JSON=$(claude -p "
 You are a drift-detection automation. Check for infrastructure drift across the following surfaces.
 
 ## EKS
@@ -38,7 +37,7 @@ You are a drift-detection automation. Check for infrastructure drift across the 
 
 ## Cloudflare WAF
 - Run \`wrangler pages deployment list 2>/dev/null || echo 'wrangler not available'\`.
-- If ${STATE_DIR}/waf-baseline.json exists (check with \`cat ${STATE_DIR}/waf-baseline.json\`),
+- If state/waf-baseline.json exists (check with \`cat state/waf-baseline.json\`),
   compare active WAF ruleset IDs against the baseline and flag additions or deletions.
   If the baseline does not exist, note that WAF baseline has not been captured yet.
 
@@ -47,7 +46,10 @@ You are a drift-detection automation. Check for infrastructure drift across the 
   and report any hits.
 
 ## Output
-Write a JSON findings file to ${FINDINGS_FILE} with this exact structure:
+Output ONLY the following JSON object as your final response — no surrounding text, no code fences.
+Set verdict to \"DRIFT_DETECTED\" if any surface shows drift, otherwise \"CLEAN\".
+Do not use the Write tool.
+
 {
   \"timestamp\": \"${DATE}\",
   \"eks\": { \"drifted\": false, \"findings\": [] },
@@ -56,16 +58,24 @@ Write a JSON findings file to ${FINDINGS_FILE} with this exact structure:
   \"deprecated_apis\": { \"found\": false, \"findings\": [] },
   \"verdict\": \"CLEAN\"
 }
-Set verdict to \"DRIFT_DETECTED\" if any surface shows drift.
 
 Do not modify any infrastructure.
 " \
   --allowedTools \
-    "Bash(kubectl get *),Bash(kubectl get --raw *),Bash(flux get *),Bash(aws rds describe-db-clusters *),Bash(aws rds describe-db-instances *),Bash(wrangler pages deployment list *),Bash(cat *),Bash(grep *),Write(${STATE_DIR}/*)" \
-  --output-format json > "${API_RESPONSE_FILE}"
+    "Bash(kubectl get *),Bash(kubectl get --raw *),Bash(flux get *),Bash(aws rds describe-db-clusters *),Bash(aws rds describe-db-instances *),Bash(wrangler pages deployment list *),Bash(cat state/*),Bash(grep *)" \
+  --output-format json 2>&1); then
+  echo "WARNING: drift detection claude -p failed." >&2
+fi
 
-# Read the verdict from the structured findings file Claude wrote — not from the API envelope
-VERDICT=$(jq -r '.verdict // "UNKNOWN"' "${FINDINGS_FILE}" 2>/dev/null || echo "UNKNOWN")
+# Extract Claude's JSON response and write findings file
+RESULT=$(echo "${API_JSON}" | jq -r '.result // empty' 2>/dev/null || true)
+if [[ -n "${RESULT}" ]]; then
+  echo "${RESULT}" > "${FINDINGS_FILE}"
+  VERDICT=$(echo "${RESULT}" | jq -r '.verdict // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+else
+  VERDICT="UNKNOWN"
+fi
+
 if [[ "${VERDICT}" == "DRIFT_DETECTED" ]]; then
   cp "${FINDINGS_FILE}" "${REPO_ROOT}/triage/drift-latest.json"
   echo "Drift detected — findings in triage/drift-latest.json"

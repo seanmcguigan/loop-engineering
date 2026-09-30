@@ -13,14 +13,18 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write   # for OIDC AWS auth
+      id-token: write        # required for OIDC AWS auth
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
+      # Conditional: skipped gracefully if AWS_CI_ROLE_ARN is not yet configured.
+      # Without credentials, terraform plan is skipped but checkov/OPA still run against source files.
       - name: Configure AWS credentials (OIDC)
+        id: aws-auth
+        if: ${{ secrets.AWS_CI_ROLE_ARN != '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
@@ -37,7 +41,9 @@ jobs:
           curl -sL https://openpolicyagent.org/downloads/latest/opa_linux_amd64 -o /usr/local/bin/opa
           chmod +x /usr/local/bin/opa
 
+      # Only runs if AWS credentials are available — terraform plan needs backend access.
       - name: Terraform init (all changed module directories)
+        if: steps.aws-auth.outcome == 'success'
         run: |
           git diff --name-only origin/main...HEAD \
             | grep -E '\.tf$' \

@@ -1,5 +1,15 @@
 {
   "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/stop-require-terraform-valid.sh"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
@@ -43,7 +53,9 @@
       "Read(*)",
       "Write(clusters/**)",
       "Write(terraform/modules/**)",
-      "Write(clusters/base/**)"
+      "Write(clusters/base/**)",
+      "Write(state/**)",
+      "Write(triage/**)"
     ],
     "deny": [
       "Bash(kubectl delete namespace:*)",

@@ -10,18 +10,24 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      id-token: write       # required for OIDC AWS auth
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
+      # Conditional: skipped gracefully if AWS_CI_ROLE_ARN is not yet configured.
+      # The drift script handles missing AWS credentials by noting "not connected" in findings.
       - name: Configure AWS credentials (OIDC)
+        id: aws-auth
+        if: ${{ secrets.AWS_CI_ROLE_ARN != '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
           aws-region: eu-west-1
 
+      # Only runs if AWS credentials are available — requires a live EKS cluster.
       - name: Set up kubectl and flux
+        if: steps.aws-auth.outcome == 'success'
         run: |
           aws eks update-kubeconfig --name prod-cluster --region eu-west-1
           curl -sL https://github.com/fluxcd/flux2/releases/download/v2.3.0/flux_2.3.0_linux_amd64.tar.gz \
@@ -30,15 +36,19 @@ jobs:
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
 
+      # Always runs — the drift script handles gracefully whichever surfaces are not yet connected.
       - name: Run drift detection loop
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: bash loops/drift-detection.sh
 
+      # Always runs — uploads whatever findings were produced, even on partial runs.
+      # if: always() ensures this runs even when drift is detected (exit 1 from drift-detection.sh).
       - name: Upload findings
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: drift-findings-${{ github.run_id }}
           path: state/drift-*.json
+          if-no-files-found: warn
           retention-days: 30

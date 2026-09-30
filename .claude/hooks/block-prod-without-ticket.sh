@@ -9,7 +9,7 @@ set -euo pipefail
 INPUT="$(cat)"
 
 # Extract the bash command being run.
-# Fail closed (exit 1) if python3 is absent or the JSON is malformed — safer than
+# Fail closed (exit 2) if python3 is absent or the JSON is malformed — safer than
 # silently allowing through an unvalidated command.
 if ! COMMAND="$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('command',''))" 2>/dev/null)"; then
   cat >&2 <<'EOF'
