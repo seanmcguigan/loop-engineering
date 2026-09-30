@@ -6,3 +6,10 @@ resources:
   - pdb.yaml
   - hpa.yaml
   # peer-authentication.yaml requires Istio CRDs — omit on kind, include in prod overlay
+
+# Swap placeholder image for a real one so the pod runs on kind.
+# Replace this with your actual registry image before deploying to prod.
+images:
+  - name: your-registry/checkout-service
+    newName: nginx
+    newTag: alpine
